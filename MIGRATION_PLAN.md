@@ -1,75 +1,195 @@
-# Migration Plan: Claudia to OpenAI Codex
+# Multi-Provider AI Assistant: OpenAI Codex Integration Plan
 
 ## Overview
-This document outlines a strategy for migrating the Claudia desktop application from Anthropic's **Claude Code** to OpenAI's **Codex** model. The goal is to retain Claudia's features—project and session management, custom agents, analytics, and more—while replacing all Claude‑specific functionality with Codex equivalents.
+This document outlines a strategy for extending the Claudia desktop application to support OpenAI's **Codex** alongside Anthropic's **Claude Code**. Rather than a replacement, this is an expansion that leverages Claudia's existing MCP (Model Context Protocol) infrastructure to add Codex as an additional AI provider. The goal is to create a multi-provider architecture while preserving all existing Claude Code functionality and user workflows.
 
-## Current State Summary
-- Claudia is tightly coupled to the `claude` CLI. Rust commands spawn a separate process and stream its output into the GUI.
-- The frontend calls Tauri commands such as `execute_claude_code`, `continue_claude_code`, and `resume_claude_code` to manage interactive sessions.
-- A `claude_binary` module searches the system for the installed Claude executable and handles environment configuration.
-- Session history, settings, and checkpoints live inside `~/.claude` directories. Analytics events and UI copy all reference Claude Code terminology.
+## Current State Analysis
+Claudia has significant advantages for this integration:
 
-## Migration Goals
-1. Replace reliance on the `claude` binary with direct calls to OpenAI's Codex API.
-2. Preserve existing UX for starting, continuing, and resuming coding sessions.
-3. Maintain session history, checkpoints, and analytics using a Codex‑compatible storage layout.
-4. Provide a clean abstraction so additional providers can be added in the future.
+- **Robust MCP Infrastructure**: 727 lines of server management code in `mcp.rs` with full stdio/SSE transport support
+- **Established Patterns**: Existing process management, session storage, and UI patterns are provider-agnostic at the core level
+- **MCP Server Management**: JSON-based configuration with command, args, and environment variable support
+- **Session Management**: Mature project and session handling in `~/.claude` directories with checkpoints and analytics
 
-## Detailed Steps
-### 1. Introduce Provider Abstraction
-- Create a provider interface encapsulating "start/continue/resume session" and stream handling.
-- Implement `ClaudeProvider` as a thin wrapper around the current process‑based approach (for backward compatibility) and a new `CodexProvider` that uses OpenAI APIs.
-- Refactor frontend API utilities to dispatch through this provider layer rather than directly invoking Claude commands.
+## Key Discovery: MCP-Based Integration
+OpenAI Codex CLI supports MCP server mode via `codex mcp serve`, enabling integration through Claudia's existing MCP infrastructure. Community projects like `openai-codex-mcp` provide MCP server wrappers that can be configured as stdio-based MCP servers.
 
-### 2. Backend: Replace Process Execution with HTTP Requests
-- Remove `spawn_claude_process` and related child‑process management. Instead, create async functions that call the Codex completion API (`async-openai` crate recommended) and stream tokens to the frontend via Tauri events.
-- Delete `claude_binary.rs` and any path‑finding logic. Substitute configuration for `OPENAI_API_KEY` and model selection.
-- Adapt process registry/state to track in‑memory sessions instead of OS processes; reuse existing database schema where possible.
+## Integration Goals
+1. Add OpenAI Codex as an additional AI provider using the existing MCP infrastructure
+2. Preserve all existing Claude Code functionality and user workflows  
+3. Enable users to choose between Claude Code and Codex on a per-session basis
+4. Leverage existing session management, checkpoints, and analytics with provider awareness
+5. Create a foundation for future AI provider integrations
 
-### 3. Session Storage & File Layout
-- Replace `~/.claude` directories with a new provider‑agnostic path such as `~/.codexia`.
-- Migrate existing session files and checkpoints to the new structure (write a one‑time migration script).
-- Update checkpoints, `CLAUDE.md` management, and hooks to read/write from the new root.
+## Technical Implementation Plan
 
-### 4. Frontend Updates
-- Rename public UI elements from “Claude” to “Codex” or a neutral term like “AI Assistant.”
-- Update `src/lib/api.ts` to expose provider‑neutral methods (`executeSession`, `continueSession`, `resumeSession`). Internally, call the active provider.
-- Adjust components that listen for events like `claude-output` to use provider‑agnostic channels.
+### Phase 1: MCP Integration Foundation (3-4 days)
+**Setup Codex MCP Server**
+- Configure OpenAI Codex CLI with MCP server capabilities using `codex mcp serve`
+- Extend existing `mcp_add()` function to support Codex-specific server configuration:
+  ```rust
+  // Example configuration
+  mcp_add(
+      app,
+      "codex-assistant".to_string(),
+      "stdio".to_string(),
+      Some("codex".to_string()),
+      vec!["mcp", "serve", "--stdio"],
+      env_vars, // Include OPENAI_API_KEY
+      None,
+      "user".to_string()
+  )
+  ```
+- Add OpenAI API key management to existing encrypted settings infrastructure
+- Test connectivity using existing `mcp_test_connection()` function
 
-### 5. Agent & MCP Features
-- Ensure custom agents use the Codex provider for execution. Add configuration options for model, temperature, and tool usage.
-- Review MCP server management to confirm compatibility with Codex or provide alternative tooling if required.
+### Phase 2: Provider Abstraction (1 week)
+**Create Provider Interface**
+```rust
+pub trait CodeExecutionProvider {
+    async fn start_session(&self, prompt: &str, project_path: &str) -> Result<SessionHandle, String>;
+    async fn continue_session(&self, session_id: &str, input: &str) -> Result<String, String>;
+    async fn get_session_history(&self, session_id: &str) -> Result<Vec<Message>, String>;
+    fn get_provider_type(&self) -> ProviderType;
+    fn get_provider_name(&self) -> String;
+}
 
-### 6. Analytics & Telemetry
-- Extend analytics to track Codex usage (tokens, latency, cost). Update existing events to distinguish between providers.
-- Provide a migration script to convert historical Claude usage data or clearly separate the two datasets.
+pub enum ProviderType {
+    ClaudeCode,
+    CodexMCP,
+}
+```
 
-### 7. Security & Configuration
-- Support API key management via encrypted local storage. Provide UI for entering and testing `OPENAI_API_KEY`.
-- Review and tighten scopes for network/file permissions given the removal of external processes.
+**Implement Providers**
+- `ClaudeCodeProvider`: Wraps existing Claude Code process management
+- `CodexMCPProvider`: Communicates with Codex via MCP stdio protocol
+- Update `commands/claude.rs` to route through provider abstraction
+- Maintain existing event streaming patterns with provider context
 
-### 8. Testing & QA
-- Add unit tests for the provider abstraction and Codex streaming implementation.
-- Update existing integration tests to run against a mocked Codex endpoint.
-- Perform manual QA on all major features: session management, agents, checkpoints, and analytics.
+### Phase 3: Frontend Integration (1 week)
+**Provider Selection UI**
+- Add provider dropdown to session creation dialog
+- Update session tabs to show provider indicator (Claude/Codex icons)
+- Modify `src/lib/api.ts` to include provider parameter:
+  ```typescript
+  export interface SessionStartRequest {
+    prompt: string;
+    projectPath: string;
+    provider: 'claude' | 'codex';
+  }
+  ```
 
-### 9. Documentation & Release
-- Rename repository references from Claudia to a Codex‑friendly name as desired.
-- Update README, screenshots, and marketing copy to describe Codex integration.
-- Provide clear upgrade instructions for existing users, including how to migrate their `~/.claude` data.
+**Session Management Updates**
+- Extend session metadata to include provider information
+- Update session restoration logic to use appropriate provider
+- Add provider-specific settings panels in preferences
 
-## Estimated Timeline
+### Phase 4: Feature Extensions (3-4 days)
+**Agent Integration**
+- Extend custom agents to support provider selection
+- Add provider-specific configuration (model, temperature, max tokens)
+- Update agent execution to use selected provider
+
+**Analytics & Cost Tracking**
+- Extend existing usage analytics to differentiate between providers
+- Add OpenAI-specific cost calculation and token counting
+- Update analytics dashboard with provider-aware visualizations
+- Implement usage monitoring and optional spending limits
+
+**Testing & Documentation**
+- Comprehensive testing of both providers
+- Update user documentation for provider selection
+- Create OpenAI API key setup guide
+
+## Session Storage Schema Updates
+
+Extend existing session format to include provider information:
+
+```json
+{
+  "type": "session_start",
+  "provider": "codex",
+  "provider_config": {
+    "model": "gpt-4",
+    "temperature": 0.7
+  },
+  "message": {
+    "role": "user", 
+    "content": "..."
+  },
+  "timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+## MCP Server Configuration
+
+Example Codex MCP server configuration:
+```json
+{
+  "mcpServers": {
+    "codex-assistant": {
+      "command": "codex",
+      "args": ["mcp", "serve", "--stdio"],
+      "env": {
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+## Implementation Timeline
+
 | Phase | Tasks | Duration |
 | --- | --- | --- |
-| **1. Abstraction Layer** | Provider interface, basic Codex client, feature toggles | 1–2 weeks |
-| **2. Core Migration** | Replace CLI logic, session storage, API key management | 2–3 weeks |
-| **3. Feature Parity** | Agents, analytics, MCP, testing | 2 weeks |
-| **4. Docs & Release** | Documentation, migration scripts, packaging | 1 week |
+| **1. MCP Integration** | Codex MCP server setup, API key management, connectivity testing | 3-4 days |
+| **2. Provider Abstraction** | Provider interface, Claude/Codex implementations, backend routing | 1 week |
+| **3. Frontend Integration** | Provider selection UI, session management updates, visual indicators | 1 week |
+| **4. Feature Extensions** | Agent support, analytics, cost tracking, testing, documentation | 3-4 days |
 
-## Risks & Mitigations
-- **API Limits / Costs** – Implement rate limiting and cost tracking to avoid surprises.
-- **Model Differences** – Codex may behave differently than Claude Code. Provide tuning options and document known gaps.
-- **Backward Compatibility** – Keep a Claude provider during transition or offer data migration tooling.
+**Total Duration: 2-3 weeks** (vs 6-8 weeks for the original API replacement approach)
+
+## Risk Assessment & Mitigations
+
+| Risk | Impact | Likelihood | Mitigation |
+|------|--------|------------|------------|
+| **Codex MCP Server Issues** | Medium | Medium | Test thoroughly, contribute fixes to community projects |
+| **OpenAI API Costs** | High | High | Implement robust cost tracking, usage limits, spending alerts |
+| **Feature Parity Gaps** | Medium | Medium | Document differences, provide fallback options |
+| **User Experience Confusion** | Low | Medium | Clear UI indicators, comprehensive onboarding |
+| **Session Compatibility** | Low | Low | Provider labeling, appropriate error handling |
+
+## Success Metrics
+
+1. **Seamless Integration**: Existing Claude Code workflows remain unchanged
+2. **User Adoption**: Easy provider switching with clear value proposition
+3. **Cost Transparency**: Users understand and control OpenAI usage costs
+4. **Extensibility**: Architecture easily supports additional providers
+5. **Performance**: No degradation to existing Claude Code performance
+
+## Future Extensibility
+
+This architecture enables easy addition of other AI providers:
+- Anthropic Claude API (direct)
+- Google Gemini
+- Local models via Ollama
+- Custom enterprise models
+
+Each new provider requires only:
+1. MCP server configuration or direct API implementation
+2. Provider interface implementation  
+3. UI configuration options
 
 ## Conclusion
-Migrating from the Claude CLI to the Codex API requires replacing process‑based execution with HTTP streaming, introducing a provider abstraction, and updating storage, analytics, and UI terminology. With the steps above, Claudia can evolve into a Codex‑powered development assistant while retaining its rich feature set.
+
+This MCP-based integration approach leverages Claudia's existing strengths rather than replacing them. By using the established MCP infrastructure, we can add OpenAI Codex support in 2-3 weeks with minimal risk to existing functionality. Users gain provider choice while maintaining access to all Claude Code features, creating a more flexible and future-proof AI assistant platform.
+
+## Key Success Factors
+
+1. **Leverage Existing Architecture** – Build on proven MCP infrastructure rather than rebuilding
+2. **Preserve User Experience** – Maintain all existing workflows while adding new capabilities  
+3. **Incremental Deployment** – Add Codex as an option, not a replacement
+4. **Provider Transparency** – Clear indication of which provider is being used for each session
+5. **Future Extensibility** – Architecture that easily supports additional AI providers
+
+This approach transforms a risky 6-8 week migration into a manageable 2-3 week enhancement that strengthens rather than replaces Claudia's core capabilities.
